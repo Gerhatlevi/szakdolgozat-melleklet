@@ -1,0 +1,239 @@
+steps:
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    secretEnv: ['GCP_TOKEN']
+    args:
+      - -c
+      - |
+        set -e
+
+        USER_EMAIL=$(dirname "${_YAML_CONFIG_FILENAME}")
+        PROJECT_FOLDER=$(dirname "${_YAML_CONFIG_FILENAME}")
+        PROJECT_FILE=$(basename "${_YAML_CONFIG_FILENAME}")
+        trap 'gcloud pubsub topics publish cloud-build-status --message="{\"status\":\"FAILURE\",\"project\":\"$${PROJECT_FILE}\",\"email\":\"$${USER_EMAIL}\",\"msg\":\"An error occurred during the setup process, contact support for assistance\"}"' ERR
+
+        echo "Setting up .netrc for GitLab access..."
+        cat > ~/.netrc <<EOF
+        machine gitlab.com
+        login oauth2
+        password $$GCP_TOKEN
+        EOF
+        TARGET_DIR="data/distributed-projects"
+
+        chmod 600 ~/.netrc
+        echo "Cloning private GitLab repo..."
+        git clone https://gitlab.com/paripa/2-project-factory.git repo
+        cd repo
+
+        echo "Switched to branch: $(git branch --show-current)"
+
+        echo "Repository cloned successfully."
+
+        echo "Downloading YAML config from GCS..."
+        gsutil cp gs://xxx-config-yaml-files/${_YAML_CONFIG_FILENAME} temp.yaml
+
+        mkdir -p "$${TARGET_DIR}/project-yaml"
+
+        mv temp.yaml "$${TARGET_DIR}/project-yaml/$${PROJECT_FILE}"
+
+        echo "YAML file moved to $${TARGET_DIR}/project-yaml/$${PROJECT_FILE}"
+
+        echo "Copying Terraform base files to project folder..."
+        cp {main.tf,variables-fast.tf,outputs.tf} "$${TARGET_DIR}/"
+        cp templates/variables-distributed.tf "$${TARGET_DIR}/variables.tf"
+        echo "Terraform files copied to $${TARGET_DIR}"
+
+        cat > providers.tf <<EOF
+        terraform {
+          backend "gcs" {
+            bucket  = "xxx-project-state-files"
+            prefix  = "$${PROJECT_FOLDER}-$${PROJECT_FILE%.yaml}"
+            impersonate_service_account = "xxx-resman-pf-0@xxx-prod-iac-core-0.iam.gserviceaccount.com"
+          }
+        }
+
+        provider "google" {
+          impersonate_service_account = "xxx-resman-pf-0@xxx-prod-iac-core-0.iam.gserviceaccount.com"
+        }
+
+        provider "google-beta" {
+          impersonate_service_account = "xxx-resman-pf-0@xxx-prod-iac-core-0.iam.gserviceaccount.com"
+        }
+        EOF
+
+        gcloud storage cp providers.tf gs://xxx-project-state-files/$${PROJECT_FOLDER}-$${PROJECT_FILE%.yaml}/providers.tf
+
+        echo "Providers file uploaded to GCS."
+
+        echo "$${PROJECT_FILE}" > /workspace/filename.txt
+        echo "$${PROJECT_FOLDER}" > /workspace/foldername.txt
+
+  - name: 'python:3.11'
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        set -e
+        pip install --no-cache-dir pyyaml google-cloud-resource-manager packaging
+
+        FILENAME=$(cat /workspace/filename.txt)
+
+        FILEPATH="repo/data/distributed-projects/project-yaml/$${FILENAME}"
+        HIERARCHY_PATH="./repo/data/hierarchy"
+        FLAG_FILE="/workspace/parent_changed.txt"
+
+        echo "Checking parent in $$FILENAME..."
+
+        python3 - "$${FILEPATH}" "$${HIERARCHY_PATH}" "$${FLAG_FILE}" <<'EOF'
+        import yaml, sys, os, subprocess
+        from google.cloud import resourcemanager_v3
+        filename = sys.argv[1]
+        hierarchy_root = sys.argv[2]
+        flag_file = sys.argv[3]
+        default_parent = f"folders/878336572208"
+        changed = False
+
+        with open(filename) as f:
+            data = yaml.safe_load(f) or {}
+
+        parent = data.get('parent', '<missing>')
+        if not parent:
+          print(f"No parent found — setting default: {default_parent}")
+          data["parent"] = default_parent
+          changed = True
+          with open(filename, "w") as f:
+              yaml.dump(data, f, sort_keys=False)
+        else:
+          expected_folder = os.path.join(hierarchy_root, parent) + "/"
+          print(f"Expected local folder path: {expected_folder}")
+          if os.path.exists(expected_folder):
+            print(f"Parent folder exists locally in hierarchy: {expected_folder}")
+          elif parent.startswith("folders/"):
+            folder_id = parent.split("/")[1]
+            print(f"Checking if folder {folder_id} exists in GCP...")
+
+            try:
+              client = resourcemanager_v3.FoldersClient()
+              folder = client.get_folder(name=f"folders/{folder_id}")
+              print(f"Folder {folder_id} exists in GCP.")
+            except Exception as e:
+              print(f"Folder ID {folder_id} not found in GCP or access denied.")
+              data["parent"] = default_parent
+              print(f"Setting parent to default: {default_parent}")
+              changed = True
+          else:
+            print(f"Parent '{parent}' does not start with 'folders/'. Setting to default: {default_parent}")
+            data["parent"] = default_parent
+            changed = True
+
+        if changed:
+          print(f"Updating file {filename} with new parent.")
+          with open(filename, "w") as f:
+            yaml.dump(data, f, sort_keys=False)
+
+        with open(flag_file, 'w') as f:
+            f.write("True" if changed else "False")
+        EOF
+
+        echo "YAML processing completed."
+
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        set -e
+
+        USER_EMAIL=$(dirname "${_YAML_CONFIG_FILENAME}")
+        FILENAME=$(cat /workspace/filename.txt)
+        trap 'gcloud pubsub topics publish cloud-build-status --message="{\"status\":\"FAILURE\",\"project\":\"$${FILENAME}\",\"email\":\"$${USER_EMAIL}\",\"msg\":\"An error occurred during the Terraform process, contact support for assistance\"}"' ERR
+
+        FOLDERNAME=$(cat /workspace/foldername.txt)
+        TARGET_DIR="repo/data/distributed-projects/project-yaml"
+        FLAG_FILE="/workspace/parent_changed.txt"
+
+        echo "Checking parent change flag..."
+        if [[ ! -f "$$FLAG_FILE" ]]; then
+          echo "ERROR: Flag file not found: $$FLAG_FILE"
+          exit 1
+        fi
+
+        CHANGE_FLAG=$(cat "$$FLAG_FILE" | tr -d '[:space:]')
+        echo "Parent changed flag: $$CHANGE_FLAG"
+
+        if [[ "$$CHANGE_FLAG" == "True" ]]; then
+          echo "Parent value was modified — uploading updated YAML and stopping build."
+
+          gsutil cp "$${TARGET_DIR}/$${FILENAME}" "gs://xxx-config-yaml-files/$${FOLDERNAME}/$${FILENAME}"
+
+          echo "Uploaded updated YAML to gs://xxx-config-yaml-files/$${FOLDERNAME}/$${FILENAME}"
+
+          echo "Exiting Cloud Build early due to parent update."
+          exit 0
+        else
+          echo "No parent change detected. Continuing build..."
+        fi
+
+
+        apt-get update -y
+        apt-get install -y wget unzip
+        wget -q https://releases.hashicorp.com/terraform/1.7.4/terraform_1.7.4_linux_amd64.zip
+        unzip terraform_1.7.4_linux_amd64.zip -d /usr/local/bin/
+        terraform version
+
+        cd $${TARGET_DIR}
+        cd ..
+        FAST_OUTPUTS_BUCKET="xxx-prod-iac-core-outputs-0"
+
+        echo "Running Terraform for project in $${FILENAME}..."
+        mkdir -p .tf-setup
+        
+        gcloud storage cp gs://xxx-project-state-files/$${FOLDERNAME}-$${FILENAME%.yaml}/providers.tf .tf-setup/
+        gcloud storage cp gs://$${FAST_OUTPUTS_BUCKET}/tfvars/0-globals.auto.tfvars.json .tf-setup/
+        gcloud storage cp gs://$${FAST_OUTPUTS_BUCKET}/tfvars/0-bootstrap.auto.tfvars.json .tf-setup/
+        gcloud storage cp gs://$${FAST_OUTPUTS_BUCKET}/tfvars/1-resman.auto.tfvars.json .tf-setup/
+        gcloud storage cp gs://$${FAST_OUTPUTS_BUCKET}/tfvars/2-networking.auto.tfvars.json .tf-setup/ || true
+        gcloud storage cp gs://$${FAST_OUTPUTS_BUCKET}/tfvars/2-security.auto.tfvars.json .tf-setup/ || true
+
+
+        cp .tf-setup/providers.tf ./
+        ln -s .tf-setup/0-globals.auto.tfvars.json ./
+        ln -s .tf-setup/0-bootstrap.auto.tfvars.json ./
+        ln -s .tf-setup/1-resman.auto.tfvars.json ./
+        [ -f .tf-setup/2-networking.auto.tfvars.json ] && ln -s .tf-setup/2-networking.auto.tfvars.json ./
+        [ -f .tf-setup/2-security.auto.tfvars.json ] && ln -s .tf-setup/2-security.auto.tfvars.json ./
+
+        terraform init
+        terraform validate
+        terraform plan -input=false -out=plan.tfplan
+        terraform apply -input=false -auto-approve plan.tfplan
+      
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        STATUS="SUCCESS"
+
+        if [ -f /workspace/skip.txt ]; then
+          echo "Skipping setup-env step because skip.txt exists."
+          exit 0
+        fi
+
+        USER_EMAIL=$(dirname "${_YAML_CONFIG_FILENAME}")
+        PROJECT_FILE=$(basename "${_YAML_CONFIG_FILENAME}")
+
+        gcloud pubsub topics publish cloud-build-status \
+          --message="{\"status\":\"$${STATUS}\",\"email\":\"$${USER_EMAIL}\",\"project\":\"$${PROJECT_FILE}\",\"msg\":\"Project setup completed successfully.\"}"
+
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  substitution_option: 'ALLOW_LOOSE'
+  dynamic_substitutions: true
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/xxx-prod-iac-core-0/secrets/GCP_TOKEN/versions/latest
+      env: GCP_TOKEN

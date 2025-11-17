@@ -1,0 +1,212 @@
+# Copyright 2022 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+default:
+  id_tokens:
+    ID_TOKEN_GCP:
+      aud: https://iam.googleapis.com/projects/811665307727/locations/global/workloadIdentityPools/xxx-bootstrap/providers/xxx-bootstrap-gitlab
+  before_script:
+    - echo "$ID_TOKEN_GCP" > token.txt
+  image:
+    name: hashicorp/terraform
+    entrypoint:
+      - "/usr/bin/env"
+      - "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+variables:
+  GOOGLE_CREDENTIALS: cicd-sa-credentials.json
+  FAST_OUTPUTS_BUCKET: xxx-prod-iac-core-outputs-0
+  FAST_SERVICE_ACCOUNT: xxx-pf-resman-pf-1@xxx-prod-iac-core-0.iam.gserviceaccount.com
+  FAST_WIF_PROVIDER: projects/811665307727/locations/global/workloadIdentityPools/xxx-bootstrap/providers/xxx-bootstrap-gitlab 
+  TF_PROVIDERS_FILE: 2-project-factory-providers.tf
+  TF_VAR_FILES: "0-bootstrap.auto.tfvars.json 0-globals.auto.tfvars.json 1-resman.auto.tfvars.json 2-networking.auto.tfvars.json 2-security.auto.tfvars.json"
+  ENVIRONMENT_NAME: prod
+  # added variables
+  ACTION:
+    description: Action to be performed on the environment or project. Supported values are 'apply' or 'destroy'.
+    value: apply
+
+
+stages:
+  - gcp-auth
+  - tf-files
+  - tf-plan
+  - tf-apply
+  - tf-destroy
+  
+
+cache:
+  key: gcp-auth-$ENVIRONMENT_NAME
+  paths:
+    - cicd-sa-credentials.json
+    - .tf-setup
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web" # Always create the pipeline if triggered manually through the UI
+      # - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main" || $CI_COMMIT_BRANCH == "main"
+      # - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "production" || $CI_COMMIT_BRANCH == "production"
+      
+gcp-auth:
+  stage: gcp-auth
+  image:
+    name: google/cloud-sdk:slim
+  script:
+    - |
+      echo "Environment: $ENVIRONMENT_NAME"
+      echo $FAST_OUTPUTS_BUCKET
+      mkdir -p .tf-setup
+      gcloud iam workload-identity-pools create-cred-config \
+        ${FAST_WIF_PROVIDER} \
+        --service-account=${FAST_SERVICE_ACCOUNT} \
+        --service-account-token-lifetime-seconds=3600 \
+        --output-file=${GOOGLE_CREDENTIALS} \
+        --credential-source-file=token.txt
+  artifacts:
+    name: gcp-auth-$ENVIRONMENT_NAME
+    paths:
+      - .tf-setup/
+      - ${GOOGLE_CREDENTIALS}
+    expire_in: 1 day
+  environment:
+    name: $ENVIRONMENT_NAME
+    action: prepare
+  resource_group: $ENVIRONMENT_NAME
+  interruptible: true
+  tags:
+    - test-levi
+
+tf-files:
+  stage: tf-files
+  dependencies:
+    - gcp-auth
+  image:
+    name: google/cloud-sdk:slim
+  script:
+    # - gcloud components install -q alpha
+    - |
+      echo "Environment: $ENVIRONMENT_NAME"
+    - gcloud config set auth/credential_file_override ${GOOGLE_CREDENTIALS}
+    - |
+      gcloud alpha storage cp -r "gs://${FAST_OUTPUTS_BUCKET}/providers/${TF_PROVIDERS_FILE}" .tf-setup/
+    - |
+      gcloud alpha storage cp -r "gs://${FAST_OUTPUTS_BUCKET}/tfvars" .tf-setup/
+  artifacts:
+    name: tf-files-$ENVIRONMENT_NAME
+    paths:
+      - .tf-setup/
+      - ${GOOGLE_CREDENTIALS}
+    expire_in: 1 day
+  environment:
+    name: $ENVIRONMENT_NAME
+    action: prepare
+  resource_group: $ENVIRONMENT_NAME
+  interruptible: true
+  tags:
+    - test-levi
+
+tf-plan:
+  stage: tf-plan
+  script:
+    - |
+      echo "Environment: $ENVIRONMENT_NAME"
+    - cp .tf-setup/${TF_PROVIDERS_FILE} ./
+    - |
+      for f in ${TF_VAR_FILES}; do
+        if [ -f ".tf-setup/tfvars/$f" ]; then
+          ln -s ".tf-setup/tfvars/$f" ./
+        else
+          echo "Warning: .tf-setup/tfvars/$f not found, skipping."
+        fi
+      done
+    - terraform init
+    - terraform validate
+    - terraform plan -input=false -out ${ENVIRONMENT_NAME}.tfplan
+  dependencies:
+    - tf-files
+  environment:
+    name: $ENVIRONMENT_NAME
+    action: prepare
+  resource_group: $ENVIRONMENT_NAME
+  artifacts:
+    name: tf-plan-$ENVIRONMENT_NAME
+    paths:
+      - "*.tfplan"
+      - .tf-setup/
+      - ${GOOGLE_CREDENTIALS}
+    expire_in: 1 day
+  rules:
+    - if: $ACTION == "apply"
+  tags:
+    - test-levi
+
+tf-apply:
+  # uncomment the following lines and set the SSH key secret for private modules repo
+  # before_script:
+  #   - |
+  #     ssh-agent -a $SSH_AUTH_SOCK > /dev/null
+  #     echo "$CICD_MODULES_KEY" | base64 -d | tr -d '\r' | ssh-add - > /dev/null
+  #     mkdir -p ~/.ssh
+  #     ssh-keyscan -H 'gitlab.com' >> ~/.ssh/known_hosts
+  #     ssh-keyscan gitlab.com | sort -u - ~/.ssh/known_hosts -o ~/.ssh/known_hosts
+  stage: tf-apply
+  script:
+    - |
+      echo "Environment: $ENVIRONMENT_NAME"
+    - cp .tf-setup/${TF_PROVIDERS_FILE} ./
+    - |
+      for f in ${TF_VAR_FILES}; do
+        if [ -f ".tf-setup/tfvars/$f" ]; then
+          ln -s ".tf-setup/tfvars/$f" ./
+        else
+          echo "Warning: .tf-setup/tfvars/$f not found, skipping."
+        fi
+      done
+    - terraform init
+    - terraform validate
+    - terraform apply ${ENVIRONMENT_NAME}.tfplan
+  dependencies:
+    - tf-files
+    - tf-plan
+  when: manual
+  environment:
+    name: $ENVIRONMENT_NAME
+  resource_group: $ENVIRONMENT_NAME
+  tags:
+    - test-levi
+
+tf-destroy:
+  stage: tf-destroy
+  script:
+    - |
+      echo "Environment: $ENVIRONMENT_NAME"
+    - cp .tf-setup/${TF_PROVIDERS_FILE} ./
+    - |
+      for f in ${TF_VAR_FILES}; do
+        if [ -f ".tf-setup/tfvars/$f" ]; then
+          ln -s ".tf-setup/tfvars/$f" ./
+        else
+          echo "Warning: .tf-setup/tfvars/$f not found, skipping."
+        fi
+      done
+    - terraform init
+    - terraform validate
+    - terraform destroy --auto-approve
+  dependencies:
+    - tf-files
+    - tf-plan
+  when: manual
+  environment:
+    name: $ENVIRONMENT_NAME
+  resource_group: $ENVIRONMENT_NAME
