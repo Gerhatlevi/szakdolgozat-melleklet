@@ -104,11 +104,7 @@ steps:
           with open(filename, "w") as f:
               yaml.dump(data, f, sort_keys=False)
         else:
-          expected_folder = os.path.join(hierarchy_root, parent) + "/"
-          print(f"Expected local folder path: {expected_folder}")
-          if os.path.exists(expected_folder):
-            print(f"Parent folder exists locally in hierarchy: {expected_folder}")
-          elif parent.startswith("folders/"):
+          if parent.startswith("folders/"):
             folder_id = parent.split("/")[1]
             print(f"Checking if folder {folder_id} exists in GCP...")
 
